@@ -8,13 +8,14 @@ import hjson
 import numpy as np
 import pandas as pd
 import ray
+import talib as ta
 from ray import tune
 from ray.tune.schedulers import AsyncHyperBandScheduler
 from ray.tune.suggest import ConcurrencyLimiter
 from ray.tune.suggest.hyperopt import HyperOptSearch
-from talib import *
 
 from downloader import Downloader
+from utils import calc_cross_long_liq_price, calc_cross_shrt_liq_price, round_dn, calc_diff
 
 
 def read_config(config_path: str) -> dict:
@@ -22,36 +23,72 @@ def read_config(config_path: str) -> dict:
     return config
 
 
-def calc_cross_long_liq_price(balance, pos_size, pos_price, leverage, mm=0.004) -> float:
-    d = (pos_size * mm - pos_size)
-    if d == 0.0:
-        return 0.0
-    return (balance - pos_size * pos_price) / d
+def decide(config: dict, ohlc_view: np.ndarray, warmup: int) -> (bool, bool):
+    ema_fast = ta.EMA(ohlc_view[-warmup:, 3], timeperiod=config['ema_fast'])
+    ema_slow = ta.EMA(ohlc_view[-warmup:, 3], timeperiod=config['ema_slow'])
+    buy = False
+    sell = False
+    if ema_fast[-1] > ema_slow[-1] and ema_fast[-2] < ema_slow[-2]:
+        buy = True
+    if ema_fast[-1] < ema_slow[-1] and ema_fast[-2] > ema_slow[-2]:
+        sell = True
+    return buy, sell
 
 
-def calc_cross_shrt_liq_price(balance, pos_size, pos_price, leverage, mm=0.004) -> float:
-    abs_pos_size = abs(pos_size)
-    d = (abs_pos_size * mm - pos_size)
-    if d == 0.0:
-        return 0.0
-    return (balance - pos_size * pos_price) / d
+def do_buy(balance: float, pos_price: float, pos_size: float, pos_cost: float, price: float, taker_fee: float,
+           qty_pct: float, min_step: float, leverage: int, slippage: float):
+    full_fee = 0
+    if pos_size < 0:
+        pnl = abs(pos_size) * (pos_price - price)
+        fee = (abs(pos_size) * price) * taker_fee
+        balance -= fee
+        balance += pnl + pos_cost
+        full_fee += fee
+    pos_price = price * (1 + slippage)
+    pos_size = round_dn(qty_pct * balance * leverage / pos_price, min_step)
+    pos_cost = pos_size * pos_price / leverage
+    fee = (pos_size * pos_price) * taker_fee
+    full_fee += fee
+    balance -= (fee + pos_cost)
+    liquidation_price = calc_cross_long_liq_price(balance, pos_size, pos_price, taker_fee)
+    liquidation_price -= 0.0065 * liquidation_price
+    return balance, pos_price, pos_size, pos_cost, full_fee, liquidation_price
+
+
+def do_sell(balance: float, pos_price: float, pos_size: float, pos_cost: float, price: float, taker_fee: float,
+            qty_pct: float, min_step: float, leverage: int, slippage: float):
+    full_fee = 0
+    if pos_size > 0:
+        pnl = abs(pos_size) * (price - pos_price)
+        fee = (abs(pos_size) * price) * taker_fee
+        balance -= fee
+        balance += pnl + pos_cost
+        full_fee += fee
+    pos_price = price * (1 - slippage)
+    pos_size = -round_dn(qty_pct * balance * leverage / pos_price, min_step)
+    pos_cost = abs(pos_size) * pos_price / leverage
+    fee = (abs(pos_size) * pos_price) * taker_fee
+    full_fee += fee
+    balance -= (fee + pos_cost)
+    liquidation_price = calc_cross_shrt_liq_price(balance, pos_size, pos_price, taker_fee)
+    liquidation_price += 0.0065 * liquidation_price
+    return balance, pos_price, pos_size, pos_cost, full_fee, liquidation_price
 
 
 def backtest(config: dict, ohlc: np.ndarray, return_results: bool = False):
     balance = config['starting_balance']
     period_fast = config['ema_fast']
     period_slow = config['ema_slow']
-    warmup = max(period_slow, period_fast) * 8
+    warmup = max(period_slow, period_fast) * 10
     leverage = config['leverage']
     min_size = config['min_size']
+    min_step = config['min_step']
+    qty_pct = config['qty_pct']
     taker_fee = config['taker_fee']
-    pos = 0
+    slippage = 0.001
+    pos_size = 0
     pos_price = 0
-    # pos_cost = 0
-    closes = []
-    prev_ema_fast = 0
-    prev_ema_slow = 0
-    size = min_size * leverage
+    pos_cost = 0
     buy = False
     sell = False
     liquidation_price = 0
@@ -59,113 +96,72 @@ def backtest(config: dict, ohlc: np.ndarray, return_results: bool = False):
     # Open, High, Low, Close, Close time
     for index in range(len(ohlc)):
         row = ohlc[index]
-        if index % 1000 == 0:
-            print(index, row[4])
-        closes.append(row[3])
-        tmp = np.asarray(closes)
-        ema_fast = EMA(tmp, timeperiod=period_fast)[-1]
-        ema_slow = EMA(tmp, timeperiod=period_slow)[-1]
 
+        trade = {'balance': balance,
+                 'current_pnl': 0.0,
+                 'current_pos_cost': abs(pos_size) * pos_price / leverage,
+                 'fee': 0.0,
+                 'Close time': row[4],
+                 'action': 'Hold',
+                 'closest_liq': 1.0}
         if index >= warmup:
+            if pos_size < 0:
+                trade['closest_liq'] = calc_diff(liquidation_price, row[1])
+                trade['current_pnl'] = abs(pos_size) * (pos_price - row[3])
+            elif pos_size > 0:
+                trade['closest_liq'] = calc_diff(liquidation_price, row[2])
+                trade['current_pnl'] = abs(pos_size) * (row[3] - pos_price)
             if buy and balance > 0:
-                if pos == 0:
-                    pos_price = row[0]
-                    pos = size
-                    pos_cost = pos * pos_price / leverage
-                    fee = (pos * pos_price) * taker_fee
-                    balance -= fee
-                    liquidation_price = calc_cross_long_liq_price(balance, pos, pos_price, leverage,
-                                                                  taker_fee)
-                    liquidation_price -= 0.0065 * liquidation_price
-                elif pos < 0:
-                    pnl = abs(pos) * (pos_price - row[0])
-                    fee = (abs(pos) * row[0]) * taker_fee
-                    balance -= fee
-                    balance += pnl
-
-                    pos_price = row[0]
-                    pos = size
-                    pos_cost = pos * pos_price / leverage
-                    fee = (pos * pos_price) * taker_fee
-                    balance -= fee
-                    liquidation_price = calc_cross_long_liq_price(balance, pos, pos_price, leverage,
-                                                                  taker_fee)
-                    liquidation_price -= 0.0065 * liquidation_price
+                balance, pos_price, pos_size, pos_cost, fee, liquidation_price = do_buy(balance, pos_price, pos_size,
+                                                                                        pos_cost, row[0], taker_fee,
+                                                                                        qty_pct, min_step, leverage,
+                                                                                        slippage)
                 buy = False
+                trade['balance'] = balance
+                trade['current_pos_cost'] = pos_cost
+                trade['fee'] = fee
+                trade['current_pnl'] = abs(pos_size) * (row[3] - pos_price)
+                trade['closest_liq'] = (liquidation_price - row[2]) / row[2]
+                trade['action'] = 'Buy'
             if sell and balance > 0:
-                if pos == 0:
-                    pos_price = row[0]
-                    pos = -size
-                    pos_cost = abs(pos) * pos_price / leverage
-                    fee = (abs(pos) * pos_price) * taker_fee
-                    balance -= fee
-                    liquidation_price = calc_cross_shrt_liq_price(balance, pos, pos_price, leverage,
-                                                                  taker_fee)
-                    liquidation_price += 0.0065 * liquidation_price
-                elif pos > 0:
-                    pnl = abs(pos) * (row[0] - pos_price)
-                    fee = (abs(pos) * row[0]) * taker_fee
-                    balance -= fee
-                    balance += pnl
+                balance, pos_price, pos_size, pos_cost, fee, liquidation_price = do_sell(balance, pos_price, pos_size,
+                                                                                         pos_cost, row[0], taker_fee,
+                                                                                         qty_pct, min_step, leverage,
+                                                                                         slippage)
 
-                    pos_price = row[0]
-                    pos = -size
-                    pos_cost = abs(pos) * pos_price / leverage
-                    fee = (abs(pos) * pos_price) * taker_fee
-                    balance -= fee
-                    liquidation_price = calc_cross_shrt_liq_price(balance, pos, pos_price, leverage,
-                                                                  taker_fee)
-                    liquidation_price += 0.0065 * liquidation_price
                 sell = False
+                trade['balance'] = balance
+                trade['current_pos_cost'] = pos_cost
+                trade['fee'] = fee
+                trade['current_pnl'] = abs(pos_size) * (pos_price - row[3])
+                trade['closest_liq'] = (liquidation_price - row[1]) / row[1]
+                trade['action'] = 'Sell'
 
-            if ema_fast > ema_slow and prev_ema_fast < prev_ema_slow:
-                buy = True
-            if ema_fast < ema_slow and prev_ema_fast > prev_ema_slow:
-                sell = True
-        if buy:
-            action = 'Buy'
-        elif sell:
-            action = 'Sell'
-        else:
-            action = 'Hold'
+            buy, sell = decide(config, ohlc[:index + 1], warmup)
 
-        if pos > 0 and row[2] < liquidation_price:
-            pnl = abs(pos) * (row[2] - pos_price)
-            fee = (abs(pos) * row[2]) * taker_fee
+        if pos_size > 0 and row[2] <= liquidation_price:
+            pnl = abs(pos_size) * (row[2] - pos_price)
+            fee = (abs(pos_size) * row[2]) * taker_fee
             balance -= fee
             balance += pnl
             pos_price = 0
             pos = 0
             pos_cost = 0
-            print('Long liquidated', index, pos_price, liquidation_price, row[2], balance)
+            # print('Long liquidated', index, pos_price, liquidation_price, row[2], balance)
             break
-        if pos < 0 and row[1] > liquidation_price:
-            pnl = abs(pos) * (pos_price - row[1])
-            fee = (abs(pos) * row[1]) * taker_fee
+        if pos_size < 0 and row[1] > liquidation_price:
+            pnl = abs(pos_size) * (pos_price - row[1])
+            fee = (abs(pos_size) * row[1]) * taker_fee
             balance -= fee
             balance += pnl
             pos_price = 0
             pos = 0
             pos_cost = 0
-            print('Short liquidated', index, pos_price, liquidation_price, row[1], balance)
+            # print('Short liquidated', index, pos_price, liquidation_price, row[1], balance)
             break
-        if pos < 0:
-            pnl = abs(pos) * (pos_price - row[3])
-        elif pos > 0:
-            pnl = abs(pos) * (row[3] - pos_price)
-        else:
-            pnl = 0
-        close_liq = 1
-        if pos < 0:
-            close_liq = (liquidation_price - row[1]) / row[1]
-        if pos > 0:
-            close_liq = (liquidation_price - row[2]) / row[2]
-        d = {'balance': balance, 'pnl': pnl, 'Close time': row[4], 'action': action, 'closest_liq': close_liq}
 
-        result.append(d)
-
-        prev_ema_fast = ema_fast
-        prev_ema_slow = ema_slow
+        if trade:
+            result.append(trade)
     result = pd.DataFrame(result)
     if return_results:
         return result
@@ -175,33 +171,29 @@ def backtest(config: dict, ohlc: np.ndarray, return_results: bool = False):
 
 def objective_function(result: pd.DataFrame) -> float:
     if not result.empty:
-        gain = ((result['balance'].iloc[-1] + result['pnl'].iloc[-1]) - (
-                result['balance'].iloc[0] + result['pnl'].iloc[0]))
+        gain = ((result['balance'].iloc[-1] + result['current_pnl'].iloc[-1] + result['current_pos_cost'].iloc[-1]) - (
+                result['balance'].iloc[0] + result['current_pnl'].iloc[0] + result['current_pos_cost'].iloc[0]))
         days = (result['Close time'].iloc[-1] - result['Close time'].iloc[0]) / (1000 * 60 * 60 * 24)
         return gain / days * result['closest_liq'].min()
     else:
-        return -1000
+        return 0.0
 
 
 def create_config(backtest_config: dict) -> dict:
     config = {}
-    config['balance'] = backtest_config['starting_balance']
+    config['starting_balance'] = backtest_config['starting_balance']
     config['min_size'] = backtest_config['min_size']
+    config['min_step'] = backtest_config['min_step']
     config['taker_fee'] = backtest_config['taker_fee']
 
-    # config['qty_pct'] = tune.quniform(backtest_config['ranges']['qty_pct'][0],
-    #                                   backtest_config['ranges']['qty_pct'][1],
-    #                                   backtest_config['ranges']['qty_pct'][2])
+    config['qty_pct'] = tune.uniform(backtest_config['ranges']['qty_pct'][0], backtest_config['ranges']['qty_pct'][1])
 
-    config['leverage'] = tune.qrandint(backtest_config['ranges']['leverage'][0],
-                                       backtest_config['ranges']['leverage'][1],
-                                       backtest_config['ranges']['leverage'][2])
-    config['ema_fast'] = tune.qrandint(backtest_config['ranges']['ema_fast'][0],
-                                       backtest_config['ranges']['ema_fast'][1],
-                                       backtest_config['ranges']['ema_fast'][2])
-    config['ema_slow'] = tune.qrandint(backtest_config['ranges']['ema_slow'][0],
-                                       backtest_config['ranges']['ema_slow'][1],
-                                       backtest_config['ranges']['ema_slow'][2])
+    config['leverage'] = tune.randint(backtest_config['ranges']['leverage'][0],
+                                      backtest_config['ranges']['leverage'][1])
+    config['ema_fast'] = tune.randint(backtest_config['ranges']['ema_fast'][0],
+                                      backtest_config['ranges']['ema_fast'][1])
+    config['ema_slow'] = tune.randint(backtest_config['ranges']['ema_slow'][0],
+                                      backtest_config['ranges']['ema_slow'][1])
     return config
 
 
@@ -209,7 +201,7 @@ def backtest_tune(ohlc: np.ndarray, backtest_config: dict):
     config = create_config(backtest_config)
     if not os.path.isdir(os.path.join('reports', backtest_config['symbol'])):
         os.makedirs(os.path.join('reports', backtest_config['symbol']), exist_ok=True)
-    session_dirpath = os.path.join('reports', backtest_config['symbol'])
+    report_path = os.path.join('reports', backtest_config['symbol'])
     iters = 10
     if 'iters' in backtest_config:
         iters = backtest_config['iters']
@@ -223,7 +215,7 @@ def backtest_tune(ohlc: np.ndarray, backtest_config: dict):
 
     initial_points = max(1, min(int(iters / 10), 20))
 
-    ray.init(num_cpus=num_cpus)
+    ray.init(num_cpus=num_cpus)  # , logging_level=logging.FATAL, log_to_driver=False)
 
     algo = HyperOptSearch(n_initial_points=initial_points)
     algo = ConcurrencyLimiter(algo, max_concurrent=num_cpus)
@@ -231,17 +223,17 @@ def backtest_tune(ohlc: np.ndarray, backtest_config: dict):
 
     analysis = tune.run(tune.with_parameters(backtest, ohlc=ohlc), metric='objective', mode='max', name='search',
                         search_alg=algo, scheduler=scheduler, num_samples=iters, config=config, verbose=1,
-                        reuse_actors=True, local_dir=session_dirpath)
+                        reuse_actors=True, local_dir=report_path)
 
     ray.shutdown()
-    session_dir = os.path.join('sessions', config['session_name'])
-    if not os.path.isdir(session_dir):
-        os.makedirs(session_dir, exist_ok=True)
+    session_path = os.path.join(os.path.join('sessions', backtest_config['symbol']), backtest_config['session_name'])
+    if not os.path.isdir(session_path):
+        os.makedirs(session_path, exist_ok=True)
 
     print('Best candidate found is: ', analysis.best_config)
-    json.dump(analysis.best_config, open(os.path.join(session_dir, 'best_config.json'), 'w'), indent=4)
+    json.dump(analysis.best_config, open(os.path.join(session_path, 'best_config.json'), 'w'), indent=4)
     result = backtest(analysis.best_config, ohlc, True)
-    result.to_csv(os.path.join(session_dir, 'best_trades.csv'), index=False)
+    result.to_csv(os.path.join(session_path, 'best_trades.csv'), index=False)
     return analysis
 
 
