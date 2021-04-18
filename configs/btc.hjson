@@ -1,0 +1,24 @@
+{
+  session_name: btc
+  user: user
+  symbol: BTCUSDT
+  interval: 15m
+
+  path: ohlc_data
+
+  starting_balance: 100.0
+  min_size: 0.001
+  min_step: 0.001
+  taker_fee: 0.0036
+
+  iters: 500
+  num_cpus: 20
+
+  ranges:
+  {
+    qty_pct: [0.0001, 1.0]
+    leverage: [2, 100]
+    ema_fast: [2, 500]
+    ema_slow: [2, 500]
+  }
+}
