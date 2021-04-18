@@ -4,6 +4,7 @@ import datetime
 import json
 import os
 import sys
+import time
 
 import aiohttp
 import pandas as pd
@@ -85,6 +86,8 @@ async def main(args: list):
     path = args.p
     downloader = Downloader(symbol, interval, path)
     await downloader.get_klines()
+    # Needed to avoid getting an event loop error when exiting.
+    time.sleep(0.1)
 
 
 if __name__ == '__main__':
