@@ -53,12 +53,14 @@ class Downloader:
                 parser.parse('2019-01-01 00:00:00').replace(tzinfo=datetime.timezone.utc).timestamp() * 1000)
         while int(datetime.datetime.now(tz.UTC).timestamp() * 1000) - start_time > 60000:
             print(datetime.datetime.now(), 'Fetching', self.symbol, 'from', self.timestamp_to_time(start_time))
+            start = time.time()
             candles = await self.download_klines(self.symbol, self.interval, start_time=start_time)
             df = pd.concat([df, candles])
             df.sort_values('Open time', inplace=True)
             df.drop_duplicates('Open time', inplace=True)
             start_time = int(df['Close time'].iloc[-1])
-            await asyncio.sleep(0.25)
+            wait_time = max(0.0, 0.25 - time.time() - start)
+            await asyncio.sleep(wait_time)
         print('Saving file...')
         df.to_csv(self.filename, index=False)
         try:
