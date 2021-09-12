@@ -33,8 +33,8 @@ async def main(args: list):
     intervals = args.i
     path = args.p
     symbols = await get_all_symbols()
-    for symbol in symbols:
-        for interval in intervals:
+    for interval in intervals:
+        for symbol in symbols:
             downloader = Downloader(symbol, interval, path)
             await downloader.get_klines()
 
