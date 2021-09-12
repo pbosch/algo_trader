@@ -78,16 +78,17 @@ async def main(args: list):
                                         description='Downloads kline data for symbol on Binance Futures.')
     argparser.add_argument('-s', '--symbol', type=str, required=True, dest='s',
                            help='Symbol pair to download data for.')
-    argparser.add_argument('-i', '--interval', type=str, required=True, dest='i',
+    argparser.add_argument('-i', '--interval', nargs='*', type=str, required=True, dest='i',
                            help='Interval of the candles in the form 1m, 4h, etc.')
     argparser.add_argument('-p', '--path', type=str, required=False, dest='p', default='data',
                            help='Path to save data to.')
     args = argparser.parse_args()
-    interval = args.i
+    intervals = args.i
     symbol = args.s
     path = args.p
-    downloader = Downloader(symbol, interval, path)
-    await downloader.get_klines()
+    for interval in intervals:
+        downloader = Downloader(symbol, interval, path)
+        await downloader.get_klines()
     # Needed to avoid getting an event loop error when exiting.
     time.sleep(0.1)
 
