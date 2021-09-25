@@ -59,6 +59,9 @@ class Downloader:
             df.sort_values('Open time', inplace=True)
             df.drop_duplicates('Open time', inplace=True)
             start_time = int(df['Close time'].iloc[-1])
+            if start_time > int(datetime.datetime.now(tz.UTC).timestamp() * 1000):
+                print('Cutting of last', start_time)
+                df = df[df['Close time'] < start_time]
             wait_time = max(0.0, 0.25 - time.time() - start)
             await asyncio.sleep(wait_time)
         print('Saving file...')
